@@ -498,17 +498,204 @@ const chime=(kind)=>{if(!S.cfg.snd)return;try{const c=ac||(ac=new(AudioContext||
 const notes=kind==='sent'?[[880,1,.06],[1318.5,.4,.09]]:[[1174.66,1,.12],[2349.32,.25,.07],[587.33,.16,.16]];
 notes.forEach(([f,a,d])=>{const o=c.createOscillator(),og=c.createGain();o.type='sine';o.frequency.value=f;og.gain.setValueAtTime(a,t);og.gain.exponentialRampToValueAtTime(.001,t+d);o.connect(og);og.connect(g);o.start(t);o.stop(t+d+.01)})}catch(e){}};
 
+// ===== WebRTC Mesh & Direct Device-to-Device Transport Layer =====
+const RTC_ICE_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+  { urls: ['stun:stun.cloudflare.com:3478'] }
+];
+const _rtcPeers = {};
+let _sigWs = null, _sigTimer = null;
+const _tEnc = new TextEncoder(), _tDec = new TextDecoder();
+
+function mqttEncode(topic, payloadStr) {
+  const top = _tEnc.encode(topic), pay = _tEnc.encode(payloadStr);
+  let v = 2 + top.length + pay.length, rem = [];
+  do { let d = v % 128; v = v >> 7; if (v > 0) d |= 0x80; rem.push(d); } while (v > 0);
+  const buf = new Uint8Array(1 + rem.length + 2 + top.length + pay.length);
+  buf[0] = 0x30; buf.set(rem, 1);
+  let o = 1 + rem.length;
+  buf[o] = (top.length >> 8) & 0xff; buf[o + 1] = top.length & 0xff; o += 2;
+  buf.set(top, o); o += top.length;
+  buf.set(pay, o);
+  return buf;
+}
+
+function initSig() {
+  if (_sigWs && (_sigWs.readyState === WebSocket.OPEN || _sigWs.readyState === WebSocket.CONNECTING)) return;
+  const brokers = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+  const url = brokers[Math.floor(Math.random() * brokers.length)];
+  try {
+    _sigWs = new WebSocket(url, ['mqtt']);
+    _sigWs.binaryType = 'arraybuffer';
+    _sigWs.onopen = () => {
+      const cid = 'mj_' + (S.me?.id || uid()).replace(/-/g, '').slice(0, 16);
+      const cBytes = _tEnc.encode(cid);
+      const proto = [0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x3C];
+      const buf = new Uint8Array(2 + proto.length + 2 + cBytes.length);
+      buf[0] = 0x10; buf[1] = proto.length + 2 + cBytes.length;
+      buf.set(proto, 2);
+      buf[2 + proto.length] = (cBytes.length >> 8) & 0xff;
+      buf[3 + proto.length] = cBytes.length & 0xff;
+      buf.set(cBytes, 4 + proto.length);
+      _sigWs.send(buf);
+
+      const subTopic = (top) => {
+        const tb = _tEnc.encode(top);
+        const s = new Uint8Array(7 + tb.length);
+        s[0] = 0x82; s[1] = 5 + tb.length; s[2] = 0x00; s[3] = 0x01;
+        s[4] = (tb.length >> 8) & 0xff; s[5] = tb.length & 0xff;
+        s.set(tb, 6); s[6 + tb.length] = 0x00;
+        _sigWs.send(s);
+      };
+      subTopic('muji4/pub');
+      if (S.me?.id) subTopic('muji4/p/' + S.me.id);
+      clearInterval(_sigTimer);
+      _sigTimer = setInterval(() => { if (_sigWs?.readyState === WebSocket.OPEN) _sigWs.send(new Uint8Array([0xC0, 0x00])); }, 30000);
+      ann();
+    };
+    _sigWs.onmessage = e => {
+      const data = new Uint8Array(e.data);
+      if ((data[0] >> 4) === 3) {
+        let pos = 1, mult = 1, rem = 0, digit;
+        do { digit = data[pos++]; rem += (digit & 127) * mult; mult *= 128; } while ((digit & 128) !== 0);
+        const tLen = (data[pos] << 8) | data[pos + 1]; pos += 2;
+        pos += tLen;
+        try {
+          const payload = JSON.parse(_tDec.decode(data.subarray(pos)));
+          onSig(payload);
+        } catch (err) {}
+      }
+    };
+    _sigWs.onclose = () => { clearInterval(_sigTimer); setTimeout(initSig, 3500); };
+    _sigWs.onerror = () => { try { _sigWs.close(); } catch(e){} };
+  } catch (e) {}
+}
+
+function sigTx(d) {
+  if (!_sigWs || _sigWs.readyState !== WebSocket.OPEN) return;
+  const topic = (d.to && d.to !== 'public') ? ('muji4/p/' + d.to) : 'muji4/pub';
+  try { _sigWs.send(mqttEncode(topic, JSON.stringify(d))); } catch(e){}
+}
+
+function getOrCreatePeer(peerId, isInitiator) {
+  if (_rtcPeers[peerId]) return _rtcPeers[peerId];
+  const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+  const entry = { id: peerId, pc, dc: null, pendingIce: [], inChunks: {} };
+  _rtcPeers[peerId] = entry;
+
+  pc.onicecandidate = e => {
+    if (e.candidate) sigTx({ t: '_rtc_sig', from: S.me.id, to: peerId, kind: 'candidate', val: e.candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      try { pc.close(); } catch(e){}
+      delete _rtcPeers[peerId];
+    }
+  };
+  if (isInitiator) {
+    const dc = pc.createDataChannel('muji_dc', { ordered: true });
+    setupDC(peerId, dc);
+    pc.createOffer().then(off => pc.setLocalDescription(off)).then(() => {
+      sigTx({ t: '_rtc_sig', from: S.me.id, to: peerId, kind: 'offer', val: pc.localDescription });
+    }).catch(()=>{});
+  } else {
+    pc.ondatachannel = e => setupDC(peerId, e.channel);
+  }
+  return entry;
+}
+
+function setupDC(peerId, dc) {
+  if (_rtcPeers[peerId]) _rtcPeers[peerId].dc = dc;
+  dc.onmessage = e => {
+    try {
+      const pkt = JSON.parse(e.data);
+      if (pkt.__c === 0) onSig(pkt.d);
+      else if (pkt.__c === 1) {
+        const peer = _rtcPeers[peerId];
+        if (!peer) return;
+        if (!peer.inChunks[pkt.id]) peer.inChunks[pkt.id] = new Array(pkt.total);
+        peer.inChunks[pkt.id][pkt.i] = pkt.chunk;
+        if (peer.inChunks[pkt.id].filter(Boolean).length === pkt.total) {
+          const full = peer.inChunks[pkt.id].join('');
+          delete peer.inChunks[pkt.id];
+          onSig(JSON.parse(full));
+        }
+      }
+    } catch(err) {}
+  };
+  dc.onclose = () => { if (_rtcPeers[peerId]) _rtcPeers[peerId].dc = null; };
+}
+
+function rtcSend(peerId, obj) {
+  const p = _rtcPeers[peerId];
+  if (!p || !p.dc || p.dc.readyState !== 'open') return false;
+  const raw = JSON.stringify(obj);
+  if (raw.length < 28000) {
+    p.dc.send(JSON.stringify({ __c: 0, d: obj }));
+  } else {
+    const mid = uid(), size = 28000, total = Math.ceil(raw.length / size);
+    for (let i = 0; i < total; i++) {
+      p.dc.send(JSON.stringify({ __c: 1, id: mid, i, total, chunk: raw.slice(i * size, (i + 1) * size) }));
+    }
+  }
+  return true;
+}
+
+async function handleRtcSignal(d) {
+  if (!S.me || d.to !== S.me.id) return;
+  if (d.kind === 'offer') {
+    const p = getOrCreatePeer(d.from, false);
+    await p.pc.setRemoteDescription(new RTCSessionDescription(d.val));
+    while (p.pendingIce.length) await p.pc.addIceCandidate(new RTCIceCandidate(p.pendingIce.shift()));
+    const ans = await p.pc.createAnswer();
+    await p.pc.setLocalDescription(ans);
+    sigTx({ t: '_rtc_sig', from: S.me.id, to: d.from, kind: 'answer', val: ans });
+  } else if (d.kind === 'answer') {
+    const p = _rtcPeers[d.from];
+    if (p?.pc) {
+      await p.pc.setRemoteDescription(new RTCSessionDescription(d.val));
+      while (p.pendingIce.length) await p.pc.addIceCandidate(new RTCIceCandidate(p.pendingIce.shift()));
+    }
+  } else if (d.kind === 'candidate') {
+    const p = _rtcPeers[d.from] || getOrCreatePeer(d.from, false);
+    if (p.pc.remoteDescription) await p.pc.addIceCandidate(new RTCIceCandidate(d.val));
+    else p.pendingIce.push(d.val);
+  }
+}
+
 let bc;
-const initBC=()=>{try{bc=new BroadcastChannel('muji4');bc.onmessage=e=>onSig(e.data);ann();setInterval(ann,3200);setInterval(()=>{const before=S.nb.length;S.nb=S.nb.filter(p=>now()-p.seen<10000);if(S.nb.length!==before)updateOnlineUI()},4500)}catch(e){}};
-const tx=d=>{try{bc?.postMessage(d)}catch(e){}};
+const initBC=()=>{
+  try{
+    bc=new BroadcastChannel('muji4');
+    bc.onmessage=e=>onSig(e.data);
+  }catch(e){}
+  initSig();
+  ann();
+  setInterval(ann,3200);
+  setInterval(()=>{
+    const before=S.nb.length;
+    S.nb=S.nb.filter(p=>now()-p.seen<14000);
+    if(S.nb.length!==before)updateOnlineUI();
+  },4500);
+};
+
+const tx = d => {
+  try { bc?.postMessage(d); } catch(e){}
+  try {
+    if (d.to && d.to !== 'public') {
+      const direct = rtcSend(d.to, d);
+      if (!direct) sigTx(d);
+    } else {
+      let activeCount = 0;
+      Object.keys(_rtcPeers).forEach(id => { if (rtcSend(id, d)) activeCount++; });
+      sigTx(d);
+    }
+  } catch(e){}
+};
+
 const ann=()=>{if(!S.me)return;S.cfg.la[S.me.id]=now();tx({t:'a',id:S.me.id,n:S.me.name,av:S.me.av,bio:S.me.bio,lk:S.me.link,sg:S.me.song,ts:now()})};
 const blk=id=>S.bl.some(b=>b.id===id);
 
-// ===== Shared "network" mailbox (localStorage-backed cache/relay) =====
-// A real device-to-device network needs a server; this demo simulates "the same network"
-// as this browser's local storage, which persists across tabs/sessions on this device.
-// Posts/messages/notes made while a peer's tab wasn't open get queued here and are
-// delivered (pushed into their feed/inbox) the next time their tab polls or opens.
 const NETKEY=LK+'netbox';
 const netRead=()=>{try{return JSON.parse(localStorage.getItem(NETKEY)||'[]')}catch(e){return[]}};
 const netWrite=arr=>{try{localStorage.setItem(NETKEY,JSON.stringify(arr.slice(-600)))}catch(e){}};
@@ -531,7 +718,9 @@ let pms=[];
 let _view='public',_sub=null,_cid=null,_att={},_reply=null,_mt=null,_mid=null,_toastN=0,_pubSeg='chat';
 
 function onSig(d){
-if(!S.me||d.id===S.me.id||blk(d.id))return;
+if(!S.me)return;
+if(d.t==='_rtc_sig'){handleRtcSignal(d);return}
+if(d.id===S.me.id||blk(d.id))return;
 if(d.t==='net'){netApply(d.env);return}
 if(d.t==='a'){
 const i=S.nb.findIndex(p=>p.id===d.id);const existing=i>=0?S.nb[i]:null;
@@ -539,9 +728,7 @@ const isNew=!existing;const changed=isNew||existing.name!==d.n||existing.av!==d.
 const p={id:d.id,name:d.n,av:d.av,bio:d.bio,lk:d.lk,sg:d.sg,seen:d.ts};
 if(i>=0)S.nb[i]=p;else S.nb.push(p);
 if(isNew){if(!S.fr.find(f=>f.id===d.id)){S.fr.push({id:d.id,name:d.n,av:d.av,at:now()});if(!S.co[d.id])S.co[d.id]={m:[],lr:0};save()}}
-// IMPORTANT: only touch the DOM when something actually changed, and never blow away
-// whatever sub-view/scroll position the user is in. Presence heartbeats fire every ~3s;
-// unconditionally re-rendering here was the cause of the "refresh glitch" jank/flicker.
+if(S.me.id>d.id&&!_rtcPeers[d.id]){getOrCreatePeer(d.id,true)}
 if(changed&&!_sub){
 if(_view==='public')updateOnlineUI();
 else if(_view==='people')withScroll('#ppl',()=>rView({enter:false}));
@@ -564,7 +751,6 @@ function txRd(pid){if(!S.cfg.rcpt)return;const c=S.co[pid];if(!c)return;const l=
 function withScroll(sel,fn){const el=$(sel);const y=el?el.scrollTop:0;fn();requestAnimationFrame(()=>{const el2=$(sel);if(el2)el2.scrollTop=y})}
 function updateOnlineUI(){const el=$('#pubOnline');if(el)el.textContent=(S.nb.length+1)+' online'}
 
-// ===== Bots (real-looking identities via randomuser.me, with graceful offline fallback) =====
 const BB=['music lover','night owl','vibing','daydreamer','stargazer','pixel artist','cloud watcher','film nerd'];
 async function fetchRandomUsers(n){try{const r=await fetch('https://randomuser.me/api/?results='+n+'&inc=name,picture,login,nat=US,GB,CA,AU,DE,FR');
 if(!r.ok)return[];const d=await r.json();return d.results||[]}catch(e){return[]}}
@@ -625,7 +811,6 @@ if(S.bots?.length){const b=S.bots[Math.random()*S.bots.length|0];pms.push({id:b.
 async function searchSongs(q){return new Promise(res=>{const cb='_dz'+now()+(Math.random()*1e4|0);window[cb]=d=>{delete window[cb];try{document.body.removeChild(sc)}catch(e){};res(d?.data||[])};
 const sc=document.createElement('script');sc.src='https://api.deezer.com/search?q='+encodeURIComponent(q)+'&limit=12&output=jsonp&callback='+cb;sc.onerror=()=>{delete window[cb];res([])};document.body.appendChild(sc)})}
 
-// ===== View helpers =====
 function rView(opts){
 const el=$('#views');if(!el)return;
 if(_sub==='c'){rConvoVw(opts);return}
@@ -1084,7 +1269,6 @@ document.querySelectorAll('#ppl .li').forEach(el=>{const n=(el.querySelector('.l
 el.style.display=(n.includes(q)||el.querySelector('.ls')?.textContent?.toLowerCase()?.includes(q))?'':'none'})},
 };
 
-// ===== Global event delegation =====
 let _lastTapTime=0,_lastTapId=null;
 document.addEventListener('click',e=>{
 const t=e.target.closest('[data-act]');
@@ -1208,8 +1392,6 @@ setInterval(netPoll,6000);
 setInterval(()=>genBotNotes(),1800000);
 setInterval(()=>genBotFeedBatch(),1500000)}
 
-// bfcache safety net: if the page is restored from back/forward cache with stale JS state
-// (audio elements, BroadcastChannel handlers), force a clean reload instead of a glitchy resume
 window.addEventListener('pageshow',e=>{if(e.persisted)location.reload()});
 history.scrollRestoration&&(history.scrollRestoration='manual');
 
